@@ -1,0 +1,230 @@
+function doGet() {
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('🏥 Warfarin Clinic Dashboard & Tracker')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// 1. ฟังก์ชันดึงข้อมูล (มีระบบ Cache)
+function getDashboardData(selectedYear, selectedMonth, forceRefresh) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'dash_' + (selectedYear || 'all') + '_' + (selectedMonth || 'all');
+  
+  // หากไม่ได้กดปุ่มรีเฟรชบังคับ ให้หาข้อมูลจากแคชก่อน
+  if (!forceRefresh) {
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) return JSON.parse(cachedData); // โหลดทันทีไม่ถึง 1 วินาที
+  }
+  
+  // หากไม่มีแคช หรือถูกบังคับรีเฟรช ให้ไปคำนวณใหม่จาก Sheets
+  const freshData = calculateDashboardData(selectedYear, selectedMonth);
+  
+  // บันทึกผลลัพธ์ลงแคชไว้ 1 ชั่วโมง (3600 วินาที)
+  if (freshData) cache.put(cacheKey, JSON.stringify(freshData), 3600);
+  
+  return freshData;
+}
+
+// 2. ฟังก์ชันประมวลผลข้อมูล (ดึงจากหลายชีต)
+function calculateDashboardData(selectedYear, selectedMonth) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // กำหนดชีตเป้าหมายที่จะดึงข้อมูลตามปีที่เลือก
+  let targetSheets = [];
+  if (!selectedYear || selectedYear === 'ทั้งหมด') {
+    targetSheets = ['Data_2568', 'Data_2569'];
+  } else {
+    targetSheets = ['Data_' + selectedYear];
+  }
+  
+  let rows = [];
+  
+  // วนลูปดึงข้อมูลจากชีตเป้าหมาย
+  targetSheets.forEach(sheetName => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (sheet) {
+      const data = sheet.getDataRange().getValues();
+      if (data.length > 1) {
+        rows = rows.concat(data.slice(1)); // ตัดแถว Header ออกแล้วต่อข้อมูลเข้าด้วยกัน
+      }
+    }
+  });
+
+  if (rows.length === 0) return null;
+
+  const monthOrder = ['ตุลาคม', 'พฤศจิกายน', 'ธันวาคม', 'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน'];
+
+  // ประมวลผลสำหรับกราฟเปรียบเทียบ
+  const monthlyComparison = monthOrder.map(m => ({ month: m, visit68: 0, inTarget68: 0, visit69: 0, inTarget69: 0 }));
+  const monthMap = {};
+  monthlyComparison.forEach(item => { monthMap[item.month] = item; });
+
+  rows.forEach(r => {
+    const m = String(r[3]).trim();
+    const inr = parseFloat(r[5]);
+    const fy = String(r[6]).trim();
+
+    if (monthMap[m] && !isNaN(inr)) {
+      const isInTarget = (inr >= 2.0 && inr <= 3.5) ? 1 : 0;
+      if (fy === '2568') { monthMap[m].visit68 += 1; monthMap[m].inTarget68 += isInTarget; } 
+      else if (fy === '2569') { monthMap[m].visit69 += 1; monthMap[m].inTarget69 += isInTarget; }
+    }
+  });
+
+  const chartData = {
+    labels: monthOrder,
+    visit68: monthlyComparison.map(m => m.visit68),
+    visit69: monthlyComparison.map(m => m.visit69),
+    targetRate68: monthlyComparison.map(m => m.visit68 > 0 ? Number(((m.inTarget68 / m.visit68) * 100).toFixed(1)) : 0),
+    targetRate69: monthlyComparison.map(m => m.visit69 > 0 ? Number(((m.inTarget69 / m.visit69) * 100).toFixed(1)) : 0)
+  };
+
+  // กรองข้อมูลสำหรับ KPI และตาราง
+  const filteredRows = rows.filter(r => {
+    const m = String(r[3]).trim();
+    const fy = String(r[6]).trim();
+    const matchYear = (!selectedYear || selectedYear === 'ทั้งหมด') ? true : (fy === selectedYear);
+    const matchMonth = (!selectedMonth || selectedMonth === 'ทุกเดือน') ? true : (m === selectedMonth);
+    return matchYear && matchMonth;
+  });
+
+  const uniqueHNs = new Set();
+  let totalVisits = 0; let sumINR = 0; let inTargetCount = 0; let validINRCount = 0;
+
+  filteredRows.forEach(r => {
+    const hn = String(r[0]).trim();
+    const inr = parseFloat(r[5]);
+    if (hn) uniqueHNs.add(hn);
+    totalVisits++;
+    if (!isNaN(inr)) {
+      sumINR += inr; validINRCount++;
+      if (inr >= 2.0 && inr <= 3.5) inTargetCount++;
+    }
+  });
+
+  const tableStats = monthOrder.map(m => {
+    const rowsForMonth = filteredRows.filter(r => String(r[3]).trim() === m);
+    const hns = new Set();
+    let visits = 0; let sum = 0; let vCount = 0; let low = 0; let target = 0; let high = 0; let critical = 0;
+
+    rowsForMonth.forEach(r => {
+      const hn = String(r[0]).trim();
+      const inr = parseFloat(r[5]);
+      if (hn) hns.add(hn);
+      visits++;
+      if (!isNaN(inr)) {
+        sum += inr; vCount++;
+        if (inr < 2.0) low++; else if (inr <= 3.5) target++; else high++;
+        if (inr >= 5.0) critical++;
+      }
+    });
+
+    return {
+      month: m, uniquePatients: hns.size, visits: visits,
+      avgINR: vCount > 0 ? (sum / vCount).toFixed(2) : '-',
+      low: low, target: target, high: high, critical: critical,
+      targetRate: visits > 0 ? ((target / visits) * 100).toFixed(1) + '%' : '-'
+    };
+  });
+
+  // --- โค้ดส่วนที่เพิ่มใหม่: ดึงข้อมูล Vitamin K จาก "ชีต3" ---
+  const sheet3 = ss.getSheetByName('ชีต3');
+  const vkData = { opdTreated: 0, opdRefer: 0, ipdTreated: 0, ipdRefer: 0 };
+  
+  if (sheet3) {
+    const s3Data = sheet3.getDataRange().getValues();
+    // เริ่มลูปที่ i=1 เพื่อข้าม Header
+    for (let i = 1; i < s3Data.length; i++) {
+      const ptType = String(s3Data[i][4]).trim().toUpperCase(); // คอลัมน์ E (Index 4) : OPD หรือ IPD
+      const status = String(s3Data[i][5]).trim();               // คอลัมน์ F (Index 5) : สถานะ Refer
+      
+      if (ptType === 'OPD') {
+        if (status === 'Refer') vkData.opdRefer++;
+        else vkData.opdTreated++;
+      } else if (ptType === 'IPD') {
+        if (status === 'Refer') vkData.ipdRefer++;
+        else vkData.ipdTreated++;
+      }
+    }
+  }
+
+  return {
+    kpis: {
+      totalVisits: totalVisits.toLocaleString(), uniquePatients: uniqueHNs.size.toLocaleString(),
+      avgINR: validINRCount > 0 ? (sumINR / validINRCount).toFixed(2) : '-', 
+      targetPct: validINRCount > 0 ? ((inTargetCount / validINRCount) * 100).toFixed(1) + '%' : '0.0%'
+    },
+    chartData: chartData, 
+    tableStats: tableStats,
+    vitaminKData: vkData
+  };
+}
+
+// 3. ฟังก์ชันค้นหา HN (ค้นหาทะลุทุกชีต)
+function searchPatientByHN(hnQuery) {
+  if (!hnQuery) return { success: false, message: 'กรุณาระบุรหัส HN' };
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const targetSheets = ['Data_2568', 'Data_2569']; // เพิ่มปีใหม่ๆ ตรงนี้ในอนาคต
+  
+  const cleanQuery = String(hnQuery).trim().replace(/^0+/, '');
+  const records = [];
+  let patientName = '';
+  
+  targetSheets.forEach(sheetName => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (sheet) {
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        const rawHN = String(data[i][0]).trim();
+        const cleanHN = rawHN.replace(/^0+/, '');
+        
+        if (cleanHN === cleanQuery || rawHN === String(hnQuery).trim()) {
+          if (!patientName && data[i][1]) patientName = String(data[i][1]).trim();
+          
+          let dateStr = '';
+          if (data[i][2] instanceof Date) {
+            dateStr = Utilities.formatDate(data[i][2], 'Asia/Bangkok', 'dd/MM/yyyy');
+          } else {
+            dateStr = String(data[i][2]);
+          }
+          
+          const inrVal = parseFloat(data[i][5]);
+          records.push({
+            hn: rawHN, date: dateStr, month: data[i][3], year: data[i][4], fy: data[i][6], inr: !isNaN(inrVal) ? inrVal : null
+          });
+        }
+      }
+    }
+  });
+  
+  if (records.length === 0) return { success: false, message: 'ไม่พบข้อมูลผู้ป่วยรหัส HN: ' + hnQuery };
+  return { 
+    success: true, 
+    hn: hnQuery, 
+    name: maskPatientName(patientName), 
+    records: records 
+  };
+}
+
+// ฟังก์ชันย่อยสำหรับ Data Masking (เซ็นเซอร์ชื่อ-สกุล)
+function maskPatientName(fullName) {
+  if (!fullName) return 'ไม่ระบุชื่อ';
+  
+  // แยกชื่อและนามสกุลด้วยช่องว่าง
+  const parts = fullName.trim().split(/\s+/); 
+  
+  const maskedParts = parts.map((part, index) => {
+    if (part.length <= 2) return part + '***'; 
+    
+    // ชื่อส่วนแรก (มักจะมีคำนำหน้า นาย/นาง/นางสาว) ให้แสดง 4 ตัวอักษรแรก
+    // นามสกุล หรือส่วนอื่นๆ ให้แสดงแค่ 2 ตัวอักษรแรก
+    const keepCount = index === 0 ? 4 : 2; 
+    const visibleStr = part.substring(0, keepCount);
+    
+    return visibleStr + '***';
+  });
+  
+  return maskedParts.join(' ');
+}
